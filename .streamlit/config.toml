@@ -1,0 +1,17 @@
+# Thème de l'application, basé sur la palette fournie.
+# Lu automatiquement par Streamlit au lancement (depuis le dossier du projet).
+#
+# Palette :
+#   #555934  olive foncé      -> accent secondaire (graphiques)
+#   #F2E6D8  crème            -> fond principal
+#   #BF9B7A  tan              -> fond secondaire (barre latérale, encarts)
+#   #8C5B3E  brun moyen       -> couleur primaire (boutons, sélection, focus)
+#   #593E2E  brun très foncé  -> texte
+
+[theme]
+base = "light"
+primaryColor = "#1C1815"
+backgroundColor = "#FAF4E3"
+secondaryBackgroundColor = "#A5A68F"
+textColor = "#1C1815"
+font = "sans serif"

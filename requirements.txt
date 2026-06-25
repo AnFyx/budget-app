@@ -1,0 +1,9 @@
+# --- Cœur (back) — versions épinglées, à auditer périodiquement (pip-audit) ---
+requests==2.32.3
+PyJWT==2.10.1
+cryptography==43.0.3
+
+# --- Front (Streamlit) — testé avec ces versions ---
+streamlit==1.58.0
+plotly==6.8.0
+pandas==3.0.2

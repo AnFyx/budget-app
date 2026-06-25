@@ -1,0 +1,178 @@
+[
+  {
+    "category": "Frais bancaires",
+    "type": "debit",
+    "keywords": [
+      "cotisation",
+      "frais bancaires"
+    ]
+  },
+  {
+    "category": "Remboursement",
+    "type": "credit",
+    "keywords": [
+      "rembourst cb",
+      "remboursement"
+    ]
+  },
+  {
+    "category": "Retrait espèces",
+    "type": "debit",
+    "keywords": [
+      "retrait dab"
+    ]
+  },
+  {
+    "category": "Crédit",
+    "type": "debit",
+    "keywords": [
+      "echeance pret"
+    ]
+  },
+  {
+    "category": "Salaire",
+    "type": "credit",
+    "keywords": [
+      "salaire"
+    ]
+  },
+  {
+    "category": "Logement",
+    "type": "debit",
+    "keywords": [
+      "loyer"
+    ]
+  },
+  {
+    "category": "Énergie",
+    "type": "debit",
+    "keywords": [
+      "edf",
+      "engie",
+      "totalenergies"
+    ]
+  },
+  {
+    "category": "Télécom & internet",
+    "type": "debit",
+    "keywords": [
+      "free mobile",
+      "free telecom",
+      "orange",
+      "sfr",
+      "bouygues telecom"
+    ]
+  },
+  {
+    "category": "Abonnements",
+    "type": "debit",
+    "keywords": [
+      "netflix",
+      "spotify",
+      "deezer",
+      "disney plus",
+      "amazon prime"
+    ]
+  },
+  {
+    "category": "Santé",
+    "type": "any",
+    "keywords": [
+      "pharmacie"
+    ]
+  },
+  {
+    "category": "Restauration",
+    "type": "any",
+    "keywords": [
+      "restaurant",
+      "mcdonald",
+      "burger king",
+      "kfc",
+      "uber eats",
+      "deliveroo"
+    ]
+  },
+  {
+    "category": "Boulangerie",
+    "type": "any",
+    "keywords": [
+      "boulangerie"
+    ]
+  },
+  {
+    "category": "Courses",
+    "type": "any",
+    "keywords": [
+      "carrefour",
+      "leclerc",
+      "auchan",
+      "lidl",
+      "intermarche",
+      "monoprix",
+      "franprix",
+      "super u"
+    ]
+  },
+  {
+    "category": "Carburant",
+    "type": "debit",
+    "keywords": [
+      "station service",
+      "esso",
+      "shell"
+    ]
+  },
+  {
+    "category": "Transport",
+    "type": "debit",
+    "keywords": [
+      "sncf",
+      "ratp",
+      "uber",
+      "blablacar"
+    ]
+  },
+  {
+    "category": "Shopping",
+    "type": "any",
+    "keywords": [
+      "amazon",
+      "fnac",
+      "decathlon",
+      "zalando",
+      "vinted"
+    ]
+  },
+  {
+    "category": "Voyage & hébergement",
+    "type": "any",
+    "keywords": [
+      "airbnb",
+      "booking.com"
+    ]
+  },
+  {
+    "category": "Virement interne",
+    "type": "any",
+    "keywords": [
+      "vir cpte a cpte"
+    ]
+  },
+  {
+    "category": "Virement reçu",
+    "type": "credit",
+    "keywords": [
+      "vir sepa recu",
+      "vir sepa inst recu"
+    ]
+  },
+  {
+    "category": "Virement émis",
+    "type": "debit",
+    "keywords": [
+      "vir sepa emis",
+      "vir sepa inst emis"
+    ]
+  }
+]

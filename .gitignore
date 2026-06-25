@@ -1,0 +1,32 @@
+# === Secrets et données — ne JAMAIS versionner ===
+.env
+*.pem
+*.key
+*.enc
+
+# Bases et données locales (transactions en clair)
+*.db
+*.sqlite
+*.sqlite3
+
+# Règles générées au runtime (rules.default.json, lui, EST versionné comme référence)
+rules.json
+
+# Clé privée et secrets locaux (présents dans le projet)
+.secrets/
+
+# Dossiers de données applicatives
+data/
+.bnp-budget-data/
+*.tmp
+
+# Secrets Streamlit éventuels (le thème .streamlit/config.toml, lui, EST versionné)
+.streamlit/secrets.toml
+
+# === Python ===
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.ruff_cache/
