@@ -1,134 +1,117 @@
-# PoC budget BNP — agrégation via Enable Banking (AIS, lecture seule)
+# Budget App: personal bank aggregation over PSD2 (Enable Banking)
 
-Récupère tes transactions et soldes BNP via l'API Enable Banking (open banking
-DSP2), en **lecture seule**, avec stockage **chiffré au repos**. Pensé comme
-socle d'une app de budget : le connecteur bancaire est isolé du futur moteur de
-catégorisation, pour pouvoir changer d'agrégateur sans tout réécrire.
+A local, single-user budgeting tool that pulls my own bank transactions through the
+[Enable Banking](https://enablebanking.com) API (PSD2 account information, read-only),
+stores them locally, categorises them with editable rules, and displays them in a
+Streamlit interface bound to `127.0.0.1`.
 
-## Périmètre et garanties
+Personal project, built and used with one BNP Paribas account.
+The user interface, code comments and setup guide are in French; identifiers are in English.
 
-- **Lecture seule.** Aucun endpoint de paiement (PIS) n'est exposé : le scope du
-  consentement est restreint à `balances` + `transactions`. Une erreur de code
-  ne peut pas initier de virement.
-- **Données chiffrées au repos.** Session, comptes et tout état local sont
-  chiffrés en AES-256-GCM, clé dérivée d'une passphrase maître via scrypt.
-  Rien de bancaire n'est écrit en clair sur le disque.
-- **Secrets hors dépôt.** `.env`, clés `.pem` et stockage `.enc` sont dans
-  `.gitignore`. Permissions fichier restreintes au propriétaire (0600).
-- **Seul Enable Banking voit les données.** Aucun autre tiers : un unique flux
-  HTTPS (certificat vérifié) vers `api.enablebanking.com`, et un serveur de
-  callback lié à `127.0.0.1` uniquement.
+## Features
+
+- **Read-only bank access**: the consent only requests `balances` and `transactions`. The client exposes no payment endpoint.
+- **Idempotent synchronisation**: every fetch re-reads an overlapping window and upserts on a stable identity key, so replaying a fetch never creates duplicates and a *pending* transaction is updated in place once *booked*. All result pages are fetched (`continuation_key`).
+- **Rule-based categorisation at read time**: ordered keyword or regex rules with a debit/credit filter, plus per-transaction manual overrides. Editing a rule re-categorises the whole history.
+- **Streamlit interface** (four pages):
+  - *Overview*: monthly spending bars and category breakdown with drill-down.
+  - *Transactions*: filtering, manual corrections, rule creation from a transaction label.
+  - *Rules*: table editor for the rule set.
+  - *Projects*: either hand-picked transactions, or a budgeted period with an envelope split per category, planned vs. actual tracking and exclusions.
+- **CLI**: `list-banks`, `connect`, `fetch`, `show`, `summary`, `unknown`, `revoke`.
 
 ## Architecture
 
 ```
+app.py                    Streamlit interface
+run_app.py                Launcher forcing --server.address 127.0.0.1
 budget_poc/
-├── config.py           Config fail-closed depuis l'environnement
-├── secure_store.py     Coffre chiffré AES-256-GCM (scrypt) : secrets + session
-├── store.py            Persistance SQLite des transactions (synchro idempotente)
-├── tls.py              Certificat auto-signé pour le callback HTTPS local
-├── eb_client.py        Client API Enable Banking (AIS, lecture seule)
-├── callback_server.py  Serveur loopback HTTPS : capte le code OAuth
-└── cli.py              Orchestration : list-banks / connect / fetch / show / revoke
+├── config.py             Fail-closed configuration from environment variables
+├── eb_client.py          Enable Banking client (JWT auth, AIS endpoints, pagination)
+├── callback_server.py    Ephemeral HTTPS loopback server capturing the OAuth code
+├── tls.py                Self-signed certificate for the loopback callback
+├── secure_store.py       Encrypted vault (AES-256-GCM, scrypt-derived key)
+├── store.py              SQLite persistence, deduplication, projects
+├── categorizer.py        Ordered categorisation rules
+├── service.py            Fetch logic shared by the CLI and the interface
+└── cli.py                Command-line entry point
+tests/                    Unit tests (no network, no bank account needed)
+legal/                    Privacy policy and terms templates required by Enable Banking
 ```
 
-Découplage volontaire : `eb_client` ne connaît rien du budget, `store` ne connaît
-rien du réseau, `cli` orchestre. Le futur moteur de catégorisation consommera les
-transactions normalisées de `store` sans toucher à la couche bancaire.
+The bank connector knows nothing about budgeting, and the database layer knows nothing about the network: the aggregator could be replaced without touching categorisation or the interface.
 
-## Deux stockages séparés, deux niveaux de protection
+## Security design
 
-- **Coffre chiffré** (`store.enc`, AES-256-GCM) : secrets, session, IBAN complet.
-- **Base SQLite** (`transactions.db`, en clair) : les transactions. Choix assumé
-  — données non secrètes, confidentialité au repos déléguée au chiffrement disque
-  (BitLocker). L'IBAN n'y figure que tronqué (4 derniers caractères).
+- **Secrets outside the repository**: configuration comes from environment variables (`.env`, git-ignored). The application refuses to start if a required value is missing.
+- **Application authentication**: short-lived RS256 JWT (10 minutes) signed with the application's private key, which can itself be passphrase-protected.
+- **OAuth callback**: HTTPS server bound to `127.0.0.1` only, `state` parameter compared in constant time, authorisation code never logged, 5-minute timeout.
+- **API client**: TLS verification kept on, timeouts on every call, response bodies never logged, responses validated before use, identifiers URL-encoded before being placed in a path.
+- **Encrypted vault** (`store.enc`): holds the PSD2 session identifier and full account identifiers. AES-256-GCM with a key derived from a master passphrase through scrypt (N = 2^15, r = 8, p = 1). A fresh random salt and nonce are used for every write, which is atomic.
+- **Database**: parameterised SQL queries only. The `accounts` table keeps only the last four characters of the account IBAN.
+- **Interface**: never exposed to the network (`run_app.py`), usage statistics disabled.
+- **Dependencies**: pinned versions, checked with `pip-audit`.
 
-## Usage
+## Threat model and known limitations
 
-Procédure d'enregistrement Enable Banking détaillée dans
-`SETUP_ENABLE_BANKING.md` (à faire **une fois** avant tout).
+What the vault protects against: a leak of the data directory or of a backup of it, without the master passphrase.
+
+What it does **not** protect against, by design or for now:
+
+- **The transaction database is not encrypted.** `transactions.db` is plain SQLite, and each transaction's raw JSON may include counterparty names and account numbers. Confidentiality at rest relies on full-disk encryption (e.g. BitLocker).
+- **Master passphrase location.** The convenience scripts `start.ps1` and `connect.ps1` load `BUDGET_MASTER_PASSPHRASE` from `.env`. In that mode, anyone able to read the user's files gets both the passphrase and the vault. Stricter option: remove that line from `.env` (the scripts then leave the variable untouched), type the passphrase in the interface when refreshing, and before `connect.ps1` set it for the current PowerShell session only, from `Read-Host -AsSecureString` rather than in a typed command, since PowerShell saves command history to disk.
+- **Local malware or access to the running process** is out of scope: the derived key lives in memory during use.
+- **File permissions** (`0600` / `0700`) are only enforced on POSIX systems. On Windows, protection relies on the default ACLs of the user profile.
+- **Scrypt parameters are not stored in the vault file.** Changing them makes the existing vault unreadable, so `connect` must be run again.
+- **Deduplication fallback.** When the bank provides no `entry_reference`, the key is a hash of date, amount, currency, direction and label. Two genuinely identical transactions on the same day would be merged.
+- **Single account.** Designed and tested with one account; entry references of several accounts could collide (see `store.py`).
+- **Consent lifetime.** PSD2 consent expires (at most 180 days, often less): `connect` must be run again.
+
+## Getting started
+
+Requirements: Python 3.11 or later, and an Enable Banking account with a registered **production** application:
+- redirect URL `https://127.0.0.1:8765/callback`;
+- publicly reachable privacy policy and terms pages, required at registration (templates in `legal/`).
+
+The full registration procedure is in [`SETUP_ENABLE_BANKING.md`](SETUP_ENABLE_BANKING.md) (French).
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+Copy-Item .env.example .env      # then fill it in
+.\connect.ps1                    # bank consent (strong customer authentication in the browser)
+.\start.ps1                      # interface on http://127.0.0.1:8501
+```
+
+On Linux or macOS, load the variables with `set -a && source .env && set +a`, then run `python -m budget_poc.cli connect` and `python run_app.py`.
+
+## CLI
 
 ```bash
-export PYTHONPATH=.
-
-# 1. Trouver le nom exact de BNP, à reporter dans EB_ASPSP_NAME
-python -m budget_poc.cli list-banks
-
-# 2. Donner son consentement (ouvre le navigateur → SCA BNP)
-python -m budget_poc.cli connect
-
-# 3. Rafraîchir : rapatrie les transactions en base (le « bouton refresh »).
-#    SEUL point qui appelle l'API → à déclencher manuellement, pas en boucle.
-python -m budget_poc.cli fetch --from 2026-01-01
-
-# 4. Consulter (lecture base locale, AUCUN appel réseau → pas de rate limit)
-python -m budget_poc.cli show --from 2026-01-01      # avec catégorie
-python -m budget_poc.cli summary --from 2026-01-01   # totaux par catégorie
-python -m budget_poc.cli unknown                     # libellés non catégorisés
-python -m budget_poc.cli show --raw 3                # JSON brut, pour inspecter
-
-# 5. Révoquer l'accès et purger l'état chiffré (la base n'est pas supprimée)
-python -m budget_poc.cli revoke
+python -m budget_poc.cli list-banks                   # exact bank name for EB_ASPSP_NAME
+python -m budget_poc.cli connect                      # consent and encrypted session
+python -m budget_poc.cli fetch --from 2026-01-01      # the only command calling the API
+python -m budget_poc.cli show --from 2026-01-01       # local database, no network
+python -m budget_poc.cli summary --from 2026-01-01    # totals per category
+python -m budget_poc.cli unknown                      # labels matched by no rule
+python -m budget_poc.cli revoke                       # close the session, wipe the vault
 ```
 
-## Catégorisation par règles
+## Tests
 
-Les transactions sont catégorisées à la **lecture** (jamais stockées avec une
-catégorie figée) : modifier une règle re-catégorise tout l'historique. Les règles
-vivent dans `rules.json` (dans `data_dir`), éditable à la main ou par le futur
-front. Le fichier est créé au premier usage à partir des défauts
-(voir `rules.default.json` à la racine pour référence).
-
-Une règle = `{category, type, keywords}` ; `type` vaut `any`/`debit`/`credit`
-pour filtrer sur le sens (distinguer un virement reçu d'un émis). Les règles sont
-une **liste ordonnée** : la première qui matche gagne, donc on place le spécifique
-avant le général. Une transaction qu'aucune règle ne couvre tombe dans `Inconnue` ;
-`unknown` liste ces libellés pour que tu ajoutes les règles manquantes.
-
-## Synchro idempotente (déduplication)
-
-`fetch` re-récupère une fenêtre qui recouvre l'existant et fusionne par upsert sur
-une clé d'identité stable (`entry_reference` de la banque, ou hash déterministe à
-défaut). Conséquence : rejouer `fetch` ne crée jamais de doublon, et le passage
-*pending → booked* (où date et statut changent) met à jour la transaction en place
-au lieu de la dupliquer.
-
-## Front (app locale Streamlit)
-
-Interface graphique locale, réutilisant directement les modules back (pas d'API
-HTTP). **Lance-la toujours via `run_app.py`**, qui force l'écoute sur la loopback
-(`127.0.0.1`) — Streamlit, par défaut, s'exposerait sur tout le réseau local.
-
-```bash
-python run_app.py
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+.\.venv\Scripts\python.exe -m pytest
+.\.venv\Scripts\python.exe -m pip_audit -r requirements.txt
 ```
 
-Trois pages (barre latérale) :
-- **Vue d'ensemble** : camembert des dépenses par catégorie ; clic (ou sélecteur)
-  sur une part → détail des transactions. Plus dépenses/recettes/solde net.
-- **Transactions** : liste filtrable (catégorie, texte). Mini-formulaire pour
-  transformer un libellé en règle (mot-clé pré-rempli depuis le marchand, éditable).
-- **Règles** : éditeur tabulaire de `rules.json` (ajout/modif/suppression).
+The test suite runs without network access or credentials. It covers:
+- **vault**: round trip, tamper and wrong-passphrase rejection, fail-closed behaviour, unique salt and nonce;
+- **deduplication**: independence from the session account identifier, pending-to-booked update;
+- **database connections**: every connection is closed;
+- **API client**: pagination (including empty intermediate pages), repeated continuation keys, malformed responses, URL encoding of identifiers;
+- **categorisation**: default rules and rule ordering.
 
-Sécurité de l'app :
-- L'affichage ne lit que la base et `rules.json` (en clair) : aucune passphrase.
-- La **passphrase maître n'est demandée qu'au clic sur « Rafraîchir »**, utilisée
-  le temps de l'appel, puis effacée de l'environnement. Jamais conservée dans
-  l'état de session Streamlit.
-- Le bouton « Rafraîchir » est grisé si le consentement est expiré (l'app lit
-  l'expiration en clair, sans toucher au coffre) → relancer `connect` en CLI.
-- Créer une règle l'insère **en tête** (priorité max) : la dernière créée l'emporte.
+## License
 
-## Limites assumées (PoC)
-
-- **Catégorisation hors périmètre.** C'est là que se trouve 90 % de la valeur
-  d'une vraie app ; le PoC s'arrête à la récupération propre des données.
-- **Renouvellement du consentement.** Le consentement DSP2 expire (≈ 90 jours) ;
-  il faut relancer `connect`. Pas de refresh automatique ici.
-- **Dépendance Enable Banking.** Leur tier « Restricted Production » gratuit peut
-  changer (cf. GoCardless qui a fermé le sien). Le découplage limite l'impact.
-- **Callback en HTTP loopback.** Suffisant en local ; une vraie app web exigera
-  un `redirect_url` HTTPS public enregistré côté Enable Banking.
-
-
-powershell -ExecutionPolicy Bypass -File .\start.ps1
+No license: all rights reserved.
