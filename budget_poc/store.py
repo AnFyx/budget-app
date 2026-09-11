@@ -27,6 +27,8 @@ import json
 import logging
 import os
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -183,8 +185,8 @@ class TransactionStore:
     def __init__(self, db_path: Path) -> None:
         self._db_path = db_path
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        # isolation_level=None désactivé : on garde les transactions SQL explicites
-        # via le context manager `with self._connect()`.
+        # Chaque accès passe par `with self._connect() as conn:` : transaction
+        # validée en cas de succès, annulée en cas d'exception, connexion fermée.
         with self._connect() as conn:
             conn.executescript(_SCHEMA)
         self._migrate()
@@ -211,12 +213,23 @@ class TransactionStore:
                 if column not in existing:
                     conn.execute(statement)
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        """Ouvre une connexion, valide ou annule la transaction, puis la ferme.
+
+        `with sqlite3.connect(...)` seul valide la transaction mais ne ferme PAS la
+        connexion : chaque appel laissait un descripteur ouvert (verrou de fichier
+        possible sous Windows). Ce context manager garantit la fermeture.
+        """
         conn = sqlite3.connect(self._db_path)
-        conn.row_factory = sqlite3.Row
-        # Intégrité référentielle activée explicitement (off par défaut en SQLite).
-        conn.execute("PRAGMA foreign_keys = ON;")
-        return conn
+        try:
+            conn.row_factory = sqlite3.Row
+            # Intégrité référentielle activée explicitement (off par défaut en SQLite).
+            conn.execute("PRAGMA foreign_keys = ON;")
+            with conn:  # commit si succès, rollback si exception
+                yield conn
+        finally:
+            conn.close()
 
     def _harden_permissions(self) -> None:
         """Restreint l'accès au fichier de base au seul propriétaire (POSIX)."""
