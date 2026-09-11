@@ -8,6 +8,7 @@
 *.db
 *.sqlite
 *.sqlite3
+*.bak
 
 # Règles générées au runtime (rules.default.json, lui, EST versionné comme référence)
 rules.json

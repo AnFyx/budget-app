@@ -28,9 +28,11 @@ C'est l'étape qui génère ta clé privée. **Lis tout avant de cliquer Registe
    refais une app en `PRODUCTION` (aussi appelé « live ») pour tes vrais comptes.
 4. **Redirect URLs** : ajoute exactement l'URL de callback du PoC :
    ```
-   http://127.0.0.1:8765/callback
+   https://127.0.0.1:8765/callback
    ```
-   (doit correspondre au pied de la lettre à `redirect_url` du PoC).
+   (doit correspondre au pied de la lettre à `redirect_url` du PoC). HTTPS est
+   obligatoire, même en local : au retour de la banque, le navigateur affichera
+   un avertissement de certificat auto-signé, à accepter pour finaliser.
 5. **Clé** : choisis l'option de génération de clé. Deux possibilités :
    - *Génération navigateur (SubtleCrypto)* : le navigateur crée la paire et te
      fait télécharger la clé privée. **Recommandé** : la clé privée ne transite
