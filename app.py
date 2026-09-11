@@ -201,22 +201,42 @@ def _render_sidebar(
     active, message = _consent_state(settings)
     st.sidebar.caption(message)
 
-    passphrase = st.sidebar.text_input(
-        "Passphrase maître", type="password", disabled=not active
-    )
+    # Si start.ps1 a déjà chargé BUDGET_MASTER_PASSPHRASE dans l'environnement,
+    # on l'utilise telle quelle (évite les erreurs de copier-coller). Sinon, on
+    # la demande à la volée (mode strict : passphrase hors du .env).
+    env_has_passphrase = bool(os.environ.get(_PASSPHRASE_ENV, "").strip())
+    typed_passphrase = None
+    if env_has_passphrase:
+        st.sidebar.caption("Passphrase déjà chargée depuis l'environnement.")
+    else:
+        typed_passphrase = st.sidebar.text_input(
+            "Passphrase maître", type="password", disabled=not active
+        )
+
     if st.sidebar.button("Rafraîchir maintenant", disabled=not active):
-        if not passphrase:
+        if env_has_passphrase:
+            _run_fetch(settings, None)
+        elif not typed_passphrase:
             st.sidebar.error("Saisis la passphrase pour rafraîchir.")
         else:
-            _run_fetch(settings, passphrase)
+            _run_fetch(settings, typed_passphrase)
     return period, date_range
 
 
-def _run_fetch(settings: config.Settings, passphrase: str) -> None:
-    """Exécute le fetch avec la passphrase fournie, puis vide le cache."""
+def _run_fetch(settings: config.Settings, passphrase: str | None) -> None:
+    """Exécute le fetch puis vide le cache.
+
+    Si `passphrase` est None, elle est déjà présente dans l'environnement
+    (chargée par start.ps1) et on ne la réécrit pas. Sinon, on l'injecte
+    temporairement le temps de l'appel.
+    """
     try:
-        with _temporary_passphrase(passphrase), st.spinner("Rafraîchissement…"):
-            summary = service.perform_fetch(settings)
+        if passphrase is None:
+            with st.spinner("Rafraîchissement…"):
+                summary = service.perform_fetch(settings)
+        else:
+            with _temporary_passphrase(passphrase), st.spinner("Rafraîchissement…"):
+                summary = service.perform_fetch(settings)
     except (EnableBankingError, SecureStoreError, RuntimeError) as exc:
         st.sidebar.error(f"Échec : {exc}")
         return
@@ -516,23 +536,45 @@ def _page_rules(settings: config.Settings) -> None:
 
 def _page_projects(df: pd.DataFrame, settings: config.Settings) -> None:
     st.header("Projets")
-    st.caption(
-        "Un projet regroupe des transactions que tu choisis à la main "
-        "(ex. un séjour). Coche celles à inclure ; laisse décoché ce qui n'en "
-        "fait pas partie (le « bypass »)."
-    )
     db = TransactionStore(settings.db_path)
 
     with st.expander("➕ Créer un projet"):
+        kind = st.radio(
+            "Type",
+            ["Manuel (je choisis les transactions)", "Budgété (période + enveloppe)"],
+            help=(
+                "Manuel : tu coches les transactions une à une (ex. bricolage sur "
+                "l'année). Budgété : toutes les dépenses d'une période sont incluses "
+                "automatiquement, avec un budget prévisionnel (ex. des vacances)."
+            ),
+        )
         new_name = st.text_input("Nom du projet", key="new_project_name")
+        is_budget = kind.startswith("Budgété")
+        d_start = d_end = total = None
+        if is_budget:
+            today = dt.date.today()
+            c1, c2 = st.columns(2)
+            d_start = c1.date_input("Début", value=today, format="DD/MM/YYYY", key="np_start")
+            d_end = c2.date_input(
+                "Fin", value=today + dt.timedelta(days=7), format="DD/MM/YYYY", key="np_end"
+            )
+            total = st.number_input("Budget total (€)", min_value=0.0, step=50.0, value=1000.0)
+
         if st.button("Créer le projet"):
             if not new_name.strip():
                 st.error("Donne un nom au projet.")
             else:
                 try:
-                    db.create_project(new_name)
+                    if is_budget:
+                        db.create_budget_project(
+                            new_name, d_start.isoformat(), d_end.isoformat(), float(total)
+                        )
+                    else:
+                        db.create_project(new_name)
                     st.success(f"Projet « {new_name.strip()} » créé.")
                     st.rerun()
+                except ValueError as exc:
+                    st.error(str(exc))
                 except Exception:
                     st.error("Un projet porte déjà ce nom.")
 
@@ -541,9 +583,26 @@ def _page_projects(df: pd.DataFrame, settings: config.Settings) -> None:
         st.info("Aucun projet pour l'instant. Crée-en un ci-dessus.")
         return
 
-    names = {p["name"]: p["id"] for p in projects}
-    chosen_name = st.selectbox("Projet", list(names.keys()))
-    project_id = names[chosen_name]
+    labels = {
+        f"{p['name']}  ·  {'budgété' if p['kind'] == 'budget' else 'manuel'}": p["id"]
+        for p in projects
+    }
+    chosen = st.selectbox("Projet", list(labels.keys()))
+    project = db.get_project(labels[chosen])
+    if project is None:
+        return
+
+    if project["kind"] == "budget":
+        _render_budget_project(df, settings, db, project)
+    else:
+        _render_manual_project(df, settings, db, project)
+
+
+def _render_manual_project(
+    df: pd.DataFrame, settings: config.Settings, db: TransactionStore, project: dict
+) -> None:
+    project_id = project["id"]
+    st.caption("Projet manuel : coche les transactions à inclure, laisse le reste décoché.")
     member_keys = db.get_project_transactions(project_id)
 
     if df.empty:
@@ -559,7 +618,6 @@ def _page_projects(df: pd.DataFrame, settings: config.Settings) -> None:
     col2.metric("Recettes", f"{in_project[in_project['montant'] >= 0]['montant'].sum():,.2f} €")
     col3.metric("Transactions", len(in_project))
 
-    # Répartition par catégorie AU SEIN du projet.
     if not debits.empty:
         by_cat = (
             (-debits.groupby("catégorie")["montant"].sum())
@@ -571,17 +629,6 @@ def _page_projects(df: pd.DataFrame, settings: config.Settings) -> None:
         fig.update_traces(textposition="inside", textinfo="percent+label")
         st.plotly_chart(fig, use_container_width=True)
 
-    if not in_project.empty:
-        st.dataframe(
-            in_project[["date", "montant", "catégorie", "libellé"]].sort_values(
-                "date", ascending=False
-            ),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-    # --- Ajout / retrait : on filtre par dates pour cibler la période, puis
-    #     on coche les transactions à inclure (et on laisse décoché le reste). ---
     st.divider()
     st.subheader("Ajouter / retirer des transactions")
     min_date = df["date"].min().date()
@@ -629,9 +676,203 @@ def _page_projects(df: pd.DataFrame, settings: config.Settings) -> None:
         st.success(f"{changes} modification(s) enregistrée(s).")
         st.rerun()
 
+    _delete_project_expander(db, project_id)
+
+
+def _render_budget_project(
+    df: pd.DataFrame, settings: config.Settings, db: TransactionStore, project: dict
+) -> None:
+    pid = project["id"]
+    date_start, date_end = project["date_start"], project["date_end"]
+    total_budget = project["total_budget"] or 0.0
+    st.subheader(project["name"])
+    st.caption(
+        f"Période : {date_start} → {date_end} · les dépenses de cette période sont "
+        "incluses automatiquement (hors exclusions)."
+    )
+
+    exclusions = db.get_project_exclusions(pid)
+    budgets = db.get_category_budgets(pid)
+
+    # Dépenses réelles de la période, hors exclusions.
+    spent_by_cat: dict[str, float] = {}
+    spent = 0.0
+    period_debits = pd.DataFrame()
+    if not df.empty:
+        start = pd.Timestamp(date_start)
+        end = pd.Timestamp(date_end) + pd.Timedelta(days=1)
+        period = df[(df["date"] >= start) & (df["date"] < end)]
+        period_debits = period[period["montant"] < 0].copy()
+        if not period_debits.empty:
+            period_debits["dépense"] = -period_debits["montant"]
+            kept = period_debits[~period_debits["dedup_key"].isin(exclusions)]
+            spent = kept["dépense"].sum()
+            spent_by_cat = kept.groupby("catégorie")["dépense"].sum().to_dict()
+
+    # --- Chiffres clés ---
+    remaining = total_budget - spent
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Enveloppe", f"{total_budget:,.2f} €")
+    c2.metric("Dépensé", f"{spent:,.2f} €")
+    c3.metric(
+        "Reste", f"{remaining:,.2f} €",
+        delta=f"{remaining:,.2f} €",
+        delta_color="normal" if remaining >= 0 else "inverse",
+    )
+
+    # --- Répartition de l'enveloppe par catégorie (éditable) ---
+    st.markdown("**Répartition de l'enveloppe**")
+    rules = load_rules(settings.rules_path)
+    known_cats = sorted(
+        {r["category"] for r in rules}
+        | (set(df["catégorie"].unique()) if not df.empty else set())
+    )
+    budget_rows = [{"catégorie": c, "budget (€)": a} for c, a in budgets.items()] or [
+        {"catégorie": "", "budget (€)": 0.0}
+    ]
+    edited_budgets = st.data_editor(
+        pd.DataFrame(budget_rows),
+        num_rows="dynamic",
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "catégorie": st.column_config.SelectboxColumn(options=known_cats),
+            "budget (€)": st.column_config.NumberColumn(
+                min_value=0.0, step=10.0, format="%.2f"
+            ),
+        },
+        key=f"budget_editor_{pid}",
+    )
+    allocated = sum(
+        float(r["budget (€)"] or 0)
+        for _, r in edited_budgets.iterrows()
+        if str(r["catégorie"]).strip()
+    )
+    to_allocate = total_budget - allocated
+    st.caption(
+        f"Réparti : {allocated:,.2f} € / {total_budget:,.2f} € — "
+        f"{'reste à allouer' if to_allocate >= 0 else 'sur-alloué de'} "
+        f"{abs(to_allocate):,.2f} €"
+    )
+    if st.button("Enregistrer la répartition", key=f"save_budgets_{pid}"):
+        new_budgets = {
+            str(r["catégorie"]).strip(): float(r["budget (€)"] or 0)
+            for _, r in edited_budgets.iterrows()
+            if str(r["catégorie"]).strip() and float(r["budget (€)"] or 0) > 0
+        }
+        db.set_category_budgets(pid, new_budgets)
+        st.success("Répartition enregistrée.")
+        st.rerun()
+
+    # --- Suivi prévu / réel ---
+    st.markdown("**Suivi prévu / réel**")
+    all_cats = set(budgets) | set(spent_by_cat)
+    if not all_cats:
+        st.caption("Pas encore de budget réparti ni de dépense sur la période.")
+    else:
+        suivi = []
+        for cat in sorted(all_cats):
+            budget = budgets.get(cat, 0.0)
+            real = spent_by_cat.get(cat, 0.0)
+            suivi.append(
+                {
+                    "catégorie": cat,
+                    "budget (€)": budget,
+                    "dépensé (€)": real,
+                    "reste (€)": budget - real,
+                    "consommé": (real / budget) if budget > 0 else 0.0,
+                    "statut": (
+                        "hors budget" if budget == 0
+                        else "dépassé" if real > budget
+                        else "ok"
+                    ),
+                }
+            )
+        suivi_df = pd.DataFrame(suivi)
+        st.dataframe(
+            suivi_df,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "budget (€)": st.column_config.NumberColumn(format="%.2f"),
+                "dépensé (€)": st.column_config.NumberColumn(format="%.2f"),
+                "reste (€)": st.column_config.NumberColumn(format="%.2f"),
+                "consommé": st.column_config.ProgressColumn(
+                    min_value=0.0, max_value=1.0, format="%.0f%%"
+                ),
+            },
+        )
+        st.caption(
+            "« hors budget » = catégorie dépensée sans budget prévu. "
+            "Le pourcentage peut dépasser 100 % (barre pleine) en cas de dépassement."
+        )
+
+    # --- Exclure des transactions parasites (opt-out) ---
+    st.divider()
+    st.subheader("Exclure des transactions parasites")
+    if period_debits.empty:
+        st.caption("Aucune dépense sur la période.")
+    else:
+        table = period_debits.copy()
+        table["exclure"] = table["dedup_key"].isin(exclusions)
+        table = table.set_index("dedup_key").sort_values("date", ascending=False)
+        edited_excl = st.data_editor(
+            table[["exclure", "date", "dépense", "catégorie", "libellé"]],
+            use_container_width=True,
+            hide_index=True,
+            disabled=["date", "dépense", "catégorie", "libellé"],
+            column_config={
+                "exclure": st.column_config.CheckboxColumn(
+                    "exclure", help="Coché = retirée du projet (transaction parasite)."
+                )
+            },
+            key=f"excl_editor_{pid}",
+        )
+        if st.button("Enregistrer les exclusions", key=f"save_excl_{pid}"):
+            changes = 0
+            for dedup_key, row in edited_excl.iterrows():
+                now_ex = bool(row["exclure"])
+                was_ex = dedup_key in exclusions
+                if now_ex and not was_ex:
+                    db.add_exclusion(pid, dedup_key)
+                    changes += 1
+                elif not now_ex and was_ex:
+                    db.remove_exclusion(pid, dedup_key)
+                    changes += 1
+            st.success(f"{changes} modification(s) enregistrée(s).")
+            st.rerun()
+
+    # --- Modifier la période / l'enveloppe ---
+    with st.expander("⚙ Modifier la période / l'enveloppe"):
+        e1, e2 = st.columns(2)
+        ns = e1.date_input(
+            "Début", value=dt.date.fromisoformat(date_start),
+            format="DD/MM/YYYY", key=f"edit_start_{pid}",
+        )
+        ne = e2.date_input(
+            "Fin", value=dt.date.fromisoformat(date_end),
+            format="DD/MM/YYYY", key=f"edit_end_{pid}",
+        )
+        nb = st.number_input(
+            "Budget total (€)", min_value=0.0, step=50.0,
+            value=float(total_budget), key=f"edit_budget_{pid}",
+        )
+        if st.button("Mettre à jour", key=f"update_meta_{pid}"):
+            try:
+                db.update_budget_project(pid, ns.isoformat(), ne.isoformat(), float(nb))
+                st.success("Projet mis à jour.")
+                st.rerun()
+            except ValueError as exc:
+                st.error(str(exc))
+
+    _delete_project_expander(db, pid)
+
+
+def _delete_project_expander(db: TransactionStore, project_id: int) -> None:
+    """Encart de suppression d'un projet (commun aux deux types)."""
     with st.expander("🗑 Supprimer ce projet"):
         st.caption("Supprime le projet et ses associations. Les transactions, elles, restent.")
-        if st.button("Supprimer définitivement", type="secondary"):
+        if st.button("Supprimer définitivement", type="secondary", key=f"del_{project_id}"):
             db.delete_project(project_id)
             st.success("Projet supprimé.")
             st.rerun()
