@@ -16,6 +16,7 @@ import datetime as dt
 import logging
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import jwt  # PyJWT
 import requests
@@ -24,6 +25,9 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 from . import config
 
 logger = logging.getLogger(__name__)
+
+# Garde-fou de pagination : au-delà, on échoue fermé plutôt que de boucler.
+_MAX_TRANSACTION_PAGES = 200
 
 
 class EnableBankingError(RuntimeError):
@@ -51,6 +55,15 @@ def _load_private_key(path: Path) -> Any:
             "Chargement de la clé privée impossible "
             "(format invalide ou passphrase manquante/incorrecte)."
         ) from exc
+
+
+def _path_segment(value: str) -> str:
+    """Encode un identifiant pour l'insérer dans un chemin d'URL.
+
+    Les identifiants viennent de réponses de l'API (donc non fiables) : un `/` ou
+    un `..` ne doit pas pouvoir modifier la route appelée.
+    """
+    return quote(value, safe="")
 
 
 class EnableBankingClient:
@@ -198,22 +211,49 @@ class EnableBankingClient:
     def get_transactions(
         self, account_uid: str, date_from: str | None = None
     ) -> list[dict]:
-        """Récupère les transactions d'un compte (optionnellement depuis une date).
+        """Récupère TOUTES les transactions d'un compte, page par page.
+
+        L'API peut répartir le résultat sur plusieurs pages : tant que la réponse
+        contient une `continuation_key` non nulle, on relance la requête avec
+        cette clé. Une page peut être vide tout en annonçant une suite.
 
         `account_uid` provient de la création de session. `date_from` est au
         format ISO `AAAA-MM-JJ`.
         """
         if not account_uid:
             raise EnableBankingError("account_uid manquant.")
-        params = {"date_from": date_from} if date_from else None
-        data = self._get(f"/accounts/{account_uid}/transactions", params=params)
-        transactions = data.get("transactions")
-        if not isinstance(transactions, list):
-            raise EnableBankingError("Liste de transactions absente ou malformée.")
-        return transactions
+        path = f"/accounts/{_path_segment(account_uid)}/transactions"
+        base_params: dict[str, str] = {"date_from": date_from} if date_from else {}
+
+        transactions: list[dict] = []
+        continuation_key: str | None = None
+        for _ in range(_MAX_TRANSACTION_PAGES):
+            params = dict(base_params)
+            if continuation_key:
+                params["continuation_key"] = continuation_key
+            data = self._get(path, params=params or None)
+
+            page = data.get("transactions")
+            if not isinstance(page, list):
+                raise EnableBankingError("Liste de transactions absente ou malformée.")
+            transactions.extend(page)
+
+            next_key = data.get("continuation_key")
+            if not next_key:
+                return transactions
+            if not isinstance(next_key, str):
+                raise EnableBankingError("Clé de continuation malformée.")
+            if next_key == continuation_key:
+                # La même clé renvoyée deux fois bouclerait indéfiniment.
+                raise EnableBankingError("Pagination bloquée : clé de continuation répétée.")
+            continuation_key = next_key
+
+        raise EnableBankingError(
+            f"Pagination interrompue : plus de {_MAX_TRANSACTION_PAGES} pages."
+        )
 
     def revoke_session(self, session_id: str) -> None:
         """Ferme une session (et, si possible, le consentement côté banque)."""
         if not session_id:
             raise EnableBankingError("session_id manquant.")
-        self._request("DELETE", f"/sessions/{session_id}")
+        self._request("DELETE", f"/sessions/{_path_segment(session_id)}")
