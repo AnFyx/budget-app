@@ -1,0 +1,4 @@
+# Fins de ligne normalisées dans le dépôt (LF), quel que soit l'OS.
+* text=auto eol=lf
+# Scripts PowerShell en CRLF pour Windows PowerShell 5.
+*.ps1 text eol=crlf
