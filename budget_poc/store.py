@@ -76,12 +76,31 @@ CREATE TABLE IF NOT EXISTS overrides (
 );
 
 CREATE TABLE IF NOT EXISTS projects (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    name       TEXT NOT NULL UNIQUE,
-    created_at TEXT NOT NULL
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    name         TEXT NOT NULL UNIQUE,
+    created_at   TEXT NOT NULL,
+    kind         TEXT NOT NULL DEFAULT 'manual',
+    date_start   TEXT,
+    date_end     TEXT,
+    total_budget REAL
 );
 
 CREATE TABLE IF NOT EXISTS project_transactions (
+    project_id INTEGER NOT NULL,
+    dedup_key  TEXT NOT NULL,
+    PRIMARY KEY (project_id, dedup_key),
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS project_budgets (
+    project_id INTEGER NOT NULL,
+    category   TEXT NOT NULL,
+    amount     REAL NOT NULL,
+    PRIMARY KEY (project_id, category),
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS project_exclusions (
     project_id INTEGER NOT NULL,
     dedup_key  TEXT NOT NULL,
     PRIMARY KEY (project_id, dedup_key),
@@ -126,23 +145,28 @@ def _signed_amount(raw: dict) -> float:
     return -amount if indicator == "DBIT" else amount
 
 
-def _dedup_key(raw: dict, account_uid: str) -> str:
+def _dedup_key(raw: dict) -> str:
     """Calcule la clé d'identité stable d'une transaction.
 
-    Privilégie l'`entry_reference` de la banque ; à défaut, un hash déterministe
-    de champs stables. Le compte est inclus pour éviter toute collision entre
-    deux comptes différents.
+    Privilégie l'`entry_reference` de la banque (stable et unique). À défaut, un
+    hash déterministe de champs stables.
+
+    La clé ne dépend PAS de l'`uid` de compte attribué par la session : cet uid
+    change à chaque reconnexion (nouveau consentement), ce qui ferait réinsérer
+    toutes les transactions en double. Limite assumée : en multi-comptes, deux
+    comptes dont les `entry_reference` se recouvriraient pourraient entrer en
+    collision. À ce stade mono-compte, ce n'est pas un risque ; réintroduire
+    l'IBAN (stable, contrairement à l'uid) comme discriminant le cas échéant.
     """
     ref = raw.get("entry_reference")
     if isinstance(ref, str) and ref.strip():
-        return f"ref:{account_uid}:{ref.strip()}"
+        return f"ref:{ref.strip()}"
 
     amount_obj = raw.get("transaction_amount", {})
     # On privilégie la date de valeur, plus stable que la date de comptabilisation
     # entre les états pending et booked.
     date = raw.get("value_date") or raw.get("transaction_date") or ""
     parts = [
-        account_uid,
         str(date),
         str(amount_obj.get("amount", "")),
         str(amount_obj.get("currency", "")),
@@ -163,7 +187,29 @@ class TransactionStore:
         # via le context manager `with self._connect()`.
         with self._connect() as conn:
             conn.executescript(_SCHEMA)
+        self._migrate()
         self._harden_permissions()
+
+    def _migrate(self) -> None:
+        """Ajoute les colonnes manquantes aux bases créées par une version antérieure.
+
+        `CREATE TABLE IF NOT EXISTS` ne met pas à jour une table existante : on
+        ajoute donc à la main les colonnes des projets budgétés si elles manquent.
+        """
+        additions = {
+            "kind": "ALTER TABLE projects ADD COLUMN kind TEXT NOT NULL DEFAULT 'manual'",
+            "date_start": "ALTER TABLE projects ADD COLUMN date_start TEXT",
+            "date_end": "ALTER TABLE projects ADD COLUMN date_end TEXT",
+            "total_budget": "ALTER TABLE projects ADD COLUMN total_budget REAL",
+        }
+        with self._connect() as conn:
+            existing = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(projects)").fetchall()
+            }
+            for column, statement in additions.items():
+                if column not in existing:
+                    conn.execute(statement)
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self._db_path)
@@ -227,7 +273,7 @@ class TransactionStore:
         self, conn: sqlite3.Connection, account_uid: str, raw: dict, now: str
     ) -> None:
         """Upsert d'une transaction unique (requête paramétrée)."""
-        key = _dedup_key(raw, account_uid)
+        key = _dedup_key(raw)
         amount_obj = raw.get("transaction_amount", {})
         conn.execute(
             """
@@ -393,12 +439,119 @@ class TransactionStore:
             return int(cursor.lastrowid)
 
     def list_projects(self) -> list[dict]:
-        """Liste les projets, du plus récent au plus ancien."""
+        """Liste les projets, du plus récent au plus ancien (avec leur type)."""
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT id, name FROM projects ORDER BY created_at DESC"
+                "SELECT id, name, kind FROM projects ORDER BY created_at DESC"
             ).fetchall()
-        return [{"id": row["id"], "name": row["name"]} for row in rows]
+        return [{"id": r["id"], "name": r["name"], "kind": r["kind"]} for r in rows]
+
+    def get_project(self, project_id: int) -> dict | None:
+        """Retourne les métadonnées complètes d'un projet, ou None s'il n'existe pas."""
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, name, kind, date_start, date_end, total_budget
+                FROM projects WHERE id = ?
+                """,
+                (project_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def create_budget_project(
+        self,
+        name: str,
+        date_start: str,
+        date_end: str,
+        total_budget: float,
+    ) -> int:
+        """Crée un projet budgété (période + enveloppe). Retourne son id."""
+        if not name.strip():
+            raise ValueError("Le nom du projet ne peut pas être vide.")
+        if date_end < date_start:
+            raise ValueError("La date de fin précède la date de début.")
+        if total_budget < 0:
+            raise ValueError("Le budget total ne peut pas être négatif.")
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO projects
+                    (name, created_at, kind, date_start, date_end, total_budget)
+                VALUES (?, ?, 'budget', ?, ?, ?)
+                """,
+                (name.strip(), _now_iso(), date_start, date_end, total_budget),
+            )
+            return int(cursor.lastrowid)
+
+    def update_budget_project(
+        self, project_id: int, date_start: str, date_end: str, total_budget: float
+    ) -> None:
+        """Met à jour la période et l'enveloppe d'un projet budgété."""
+        if date_end < date_start:
+            raise ValueError("La date de fin précède la date de début.")
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE projects SET date_start = ?, date_end = ?, total_budget = ?
+                WHERE id = ?
+                """,
+                (date_start, date_end, total_budget, project_id),
+            )
+
+    def set_category_budgets(self, project_id: int, budgets: dict[str, float]) -> None:
+        """Remplace l'ensemble des budgets par catégorie d'un projet."""
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM project_budgets WHERE project_id = ?", (project_id,)
+            )
+            conn.executemany(
+                """
+                INSERT INTO project_budgets (project_id, category, amount)
+                VALUES (?, ?, ?)
+                """,
+                [
+                    (project_id, category, float(amount))
+                    for category, amount in budgets.items()
+                    if str(category).strip() and float(amount) > 0
+                ],
+            )
+
+    def get_category_budgets(self, project_id: int) -> dict[str, float]:
+        """Retourne les budgets par catégorie d'un projet sous forme {cat: montant}."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT category, amount FROM project_budgets WHERE project_id = ?",
+                (project_id,),
+            ).fetchall()
+        return {r["category"]: r["amount"] for r in rows}
+
+    def add_exclusion(self, project_id: int, dedup_key: str) -> None:
+        """Exclut une transaction d'un projet budgété (opt-out)."""
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO project_exclusions (project_id, dedup_key)
+                VALUES (?, ?) ON CONFLICT DO NOTHING
+                """,
+                (project_id, dedup_key),
+            )
+
+    def remove_exclusion(self, project_id: int, dedup_key: str) -> None:
+        """Réintègre une transaction précédemment exclue."""
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM project_exclusions WHERE project_id = ? AND dedup_key = ?",
+                (project_id, dedup_key),
+            )
+
+    def get_project_exclusions(self, project_id: int) -> set[str]:
+        """Retourne l'ensemble des dedup_key exclues d'un projet budgété."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT dedup_key FROM project_exclusions WHERE project_id = ?",
+                (project_id,),
+            ).fetchall()
+        return {r["dedup_key"] for r in rows}
 
     def delete_project(self, project_id: int) -> None:
         """Supprime un projet et ses associations (cascade)."""
